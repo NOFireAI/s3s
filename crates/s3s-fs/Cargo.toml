@@ -35,7 +35,7 @@ async-trait.workspace = true
 base64-simd.workspace = true
 bytes.workspace = true
 chrono = { workspace = true, default-features = false, features = ["std", "clock"] }
-clap = { workspace = true, optional = true }
+clap = { workspace = true, optional = true, features = ["env"] }
 crc32c.workspace = true
 futures.workspace = true
 hex-simd.workspace = true
