@@ -777,6 +777,31 @@ impl S3 for FileSystem {
             None
         };
 
+        // Listed objects carry the ETag the PUT stored, as S3 does; a client that
+        // reads ETags from a listing (conditional writes, consistency checks) needs it.
+        for object in &mut result_objects {
+            if let Some(key) = object.key.as_deref() {
+                let info = self.load_internal_info(&input.bucket, key).await?;
+                object.e_tag = info.as_ref().and_then(crate::checksum::load_e_tag).map(ETag::Strong);
+            }
+        }
+
+        // Under encoding-type=url, S3 returns every key and common prefix
+        // URL-encoded and clients decode `+` as a space, so a raw `+` would
+        // read back as a different key.
+        if input.encoding_type.as_ref().is_some_and(|e| e.as_str() == EncodingType::URL) {
+            for object in &mut result_objects {
+                if let Some(key) = object.key.as_mut() {
+                    *key = url_encode_listed(key);
+                }
+            }
+            for prefix in &mut result_prefixes {
+                if let Some(p) = prefix.prefix.as_mut() {
+                    *p = url_encode_listed(p);
+                }
+            }
+        }
+
         let contents = result_objects.is_empty().not().then_some(result_objects);
         let common_prefixes = result_prefixes.is_empty().not().then_some(result_prefixes);
 
@@ -1671,6 +1696,19 @@ impl S3 for FileSystem {
 
         Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
     }
+}
+
+/// Percent-encodes every byte outside the unreserved set and `/`.
+fn url_encode_listed(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 impl FileSystem {
