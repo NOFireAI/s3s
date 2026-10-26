@@ -1,0 +1,84 @@
+# Builds the s3s-fs binary at a given commit for linux x86_64 and aarch64 and
+# publishes a release with both binaries and their SHA256SUMS. Used by the
+# Ravel ClickBench entry, which downloads and verifies these binaries instead
+# of compiling s3s-fs on every benchmark machine. Manual dispatch only; the
+# tag must not start with "v", which the repository's publish workflows own.
+name: ravel s3s-fs release
+
+on:
+  workflow_dispatch:
+    inputs:
+      rev:
+        description: "Full commit to build"
+        required: true
+      tag:
+        description: "Release tag (must not start with v)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Refuse a v* tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in v*) echo "tag must not start with v" >&2; exit 1 ;; esac
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.rev }}
+          persist-credentials: false
+      - name: Check the checked-out commit
+        env:
+          REV: ${{ inputs.rev }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$REV"
+      - name: Build
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable build --locked --release -p s3s-fs --features binary
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          cp target/release/s3s-fs "s3s-fs-linux-${{ matrix.arch }}"
+          ./"s3s-fs-linux-${{ matrix.arch }}" --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: s3s-fs-linux-${{ matrix.arch }}
+          path: s3s-fs-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum s3s-fs-linux-x86_64 s3s-fs-linux-aarch64 > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REV: ${{ inputs.rev }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$REV" \
+            --title "$TAG" \
+            --notes "s3s-fs built from $REV with --features binary --locked, for the Ravel ClickBench entry. Verify against SHA256SUMS." \
+            dist/s3s-fs-linux-x86_64 dist/s3s-fs-linux-aarch64 dist/SHA256SUMS
