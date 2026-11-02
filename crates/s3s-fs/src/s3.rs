@@ -1954,8 +1954,10 @@ mod tests {
     }
 
     fn crc64nvme(body: &[u8]) -> Option<String> {
-        let mut hasher = s3s::checksum::ChecksumHasher::default();
-        hasher.crc64nvme = Some(default());
+        let mut hasher = s3s::checksum::ChecksumHasher {
+            crc64nvme: Some(default()),
+            ..Default::default()
+        };
         hasher.update(body);
         hasher.finalize().checksum_crc64nvme
     }
