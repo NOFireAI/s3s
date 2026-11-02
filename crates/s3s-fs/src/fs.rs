@@ -14,12 +14,13 @@ use std::env;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Not;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use numeric_cast::NumericCast;
 use path_absolutize::Absolutize;
@@ -32,7 +33,7 @@ const OBJECT_LOCK_STRIPES: u64 = 1024;
 pub struct FileSystem {
     pub(crate) root: PathBuf,
     tmp_file_counter: AtomicU64,
-    object_locks: Box<[RwLock<()>]>,
+    object_locks: Box<[Arc<RwLock<()>>]>,
 }
 
 pub(crate) type InternalInfo = serde_json::Map<String, serde_json::Value>;
@@ -96,7 +97,7 @@ impl FileSystem {
         let root = env::current_dir()?.join(root).canonicalize()?;
         clean_old_tmp_files(&root)?;
         let tmp_file_counter = AtomicU64::new(0);
-        let object_locks = (0..OBJECT_LOCK_STRIPES).map(|_| RwLock::new(())).collect();
+        let object_locks = (0..OBJECT_LOCK_STRIPES).map(|_| Arc::new(RwLock::new(()))).collect();
         Ok(Self {
             root,
             tmp_file_counter,
@@ -114,18 +115,23 @@ impl FileSystem {
     /// Locks an object for writing.
     ///
     /// An object is three files: the body, its attributes and its internal info, which holds the
-    /// stored checksums and `ETag`. A write checks its conditions and publishes all three under this
-    /// lock, and a read opens the body and loads both sidecars under [`Self::lock_object_read`].
-    /// So two conditional writers cannot both pass their check, and a reader never pairs one
-    /// write's body with another write's checksums. Objects share a fixed set of locks by hash:
-    /// unrelated objects can contend, but the set never grows.
-    pub(crate) async fn lock_object_write(&self, bucket: &str, key: &str) -> RwLockWriteGuard<'_, ()> {
-        self.object_locks[Self::object_lock_index(bucket, key)].write().await
+    /// stored checksums and `ETag`. A write stages all three as temporary files, then checks its
+    /// conditions under this lock and renames them into place with [`publish`], and a read opens
+    /// the body and loads both sidecars under [`Self::lock_object_read`]. So two conditional
+    /// writers cannot both pass their check, and a reader never pairs one write's body with
+    /// another write's checksums. Objects share a fixed set of locks by hash: unrelated objects
+    /// can contend, but the set never grows.
+    pub(crate) async fn lock_object_write(&self, bucket: &str, key: &str) -> OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.object_locks[Self::object_lock_index(bucket, key)])
+            .write_owned()
+            .await
     }
 
     /// Locks an object for reading; see [`Self::lock_object_write`].
-    pub(crate) async fn lock_object_read(&self, bucket: &str, key: &str) -> RwLockReadGuard<'_, ()> {
-        self.object_locks[Self::object_lock_index(bucket, key)].read().await
+    pub(crate) async fn lock_object_read(&self, bucket: &str, key: &str) -> OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.object_locks[Self::object_lock_index(bucket, key)])
+            .read_owned()
+            .await
     }
 
     /// Locks a copy's destination for writing and its source for reading. The two are taken in
@@ -137,19 +143,21 @@ impl FileSystem {
         src_key: &str,
         dst_bucket: &str,
         dst_key: &str,
-    ) -> (Option<RwLockReadGuard<'_, ()>>, RwLockWriteGuard<'_, ()>) {
+    ) -> (Option<OwnedRwLockReadGuard<()>>, OwnedRwLockWriteGuard<()>) {
         let src_index = Self::object_lock_index(src_bucket, src_key);
         let dst_index = Self::object_lock_index(dst_bucket, dst_key);
+        let src_lock = Arc::clone(&self.object_locks[src_index]);
+        let dst_lock = Arc::clone(&self.object_locks[dst_index]);
         if src_index == dst_index {
-            return (None, self.object_locks[dst_index].write().await);
+            return (None, dst_lock.write_owned().await);
         }
         if src_index < dst_index {
-            let read = self.object_locks[src_index].read().await;
-            let write = self.object_locks[dst_index].write().await;
+            let read = src_lock.read_owned().await;
+            let write = dst_lock.write_owned().await;
             (Some(read), write)
         } else {
-            let write = self.object_locks[dst_index].write().await;
-            let read = self.object_locks[src_index].read().await;
+            let write = dst_lock.write_owned().await;
+            let read = src_lock.read_owned().await;
             (Some(read), write)
         }
     }
@@ -259,16 +267,6 @@ impl FileSystem {
         Ok(Some(map))
     }
 
-    pub(crate) async fn save_internal_info(&self, bucket: &str, key: &str, info: &InternalInfo) -> Result<()> {
-        let path = self.get_internal_info_path(bucket, key)?;
-        let content = serde_json::to_vec(info)?;
-        let mut file_writer = self.prepare_file_write(&path).await?;
-        file_writer.writer().write_all(&content).await?;
-        file_writer.writer().flush().await?;
-        file_writer.done().await?;
-        Ok(())
-    }
-
     pub(crate) async fn load_upload_part_info(&self, upload_id: Uuid, part_number: PartNumber) -> Result<Option<InternalInfo>> {
         let path = self.get_upload_part_info_path(upload_id, part_number)?;
         if path.exists().not() {
@@ -351,6 +349,23 @@ impl FileSystem {
         remove_file_if_exists(&upload_info_path).await
     }
 
+    /// Writes `content` to a temporary file to be renamed over `path` by [`publish`].
+    pub(crate) async fn stage_bytes(&self, path: &Path, content: &[u8]) -> Result<Staged> {
+        let mut file_writer = self.prepare_file_write(path).await?;
+        file_writer.writer().write_all(content).await?;
+        file_writer.stage().await
+    }
+
+    pub(crate) async fn stage_object_attributes(&self, bucket: &str, key: &str, attrs: &ObjectAttributes) -> Result<Staged> {
+        let path = self.get_metadata_path(bucket, key, None)?;
+        self.stage_bytes(&path, &serde_json::to_vec(attrs)?).await
+    }
+
+    pub(crate) async fn stage_internal_info(&self, bucket: &str, key: &str, info: &InternalInfo) -> Result<Staged> {
+        let path = self.get_internal_info_path(bucket, key)?;
+        self.stage_bytes(&path, &serde_json::to_vec(info)?).await
+    }
+
     /// Write to the filesystem atomically.
     /// This is done by first writing to a temporary location and then moving the file.
     pub(crate) async fn prepare_file_write<'a>(&self, path: &'a Path) -> Result<FileWriter<'a>> {
@@ -396,6 +411,51 @@ impl<'a> FileWriter<'a> {
         self.clean_tmp = false;
         Ok(())
     }
+
+    /// Flushes the temporary file and hands it to [`publish`] instead of renaming it now.
+    pub(crate) async fn stage(mut self) -> Result<Staged> {
+        self.writer.flush().await?;
+        self.clean_tmp = false;
+        Ok(Staged {
+            tmp_path: std::mem::take(&mut self.tmp_path),
+            dest_path: self.dest_path.to_owned(),
+        })
+    }
+}
+
+/// A flushed temporary file waiting to be renamed over its destination by [`publish`]. Dropped
+/// unpublished, it removes the temporary file.
+pub(crate) struct Staged {
+    tmp_path: PathBuf,
+    dest_path: PathBuf,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.tmp_path);
+    }
+}
+
+/// Renames each staged file over its destination, in order, while `guard` is held.
+///
+/// The renames run in one blocking task that owns the guard, so once they start they all run
+/// with the lock held, even if the request that started them is dropped: a cancelled write cannot
+/// leave a body beside the previous write's sidecars, and no reader sees the files half
+/// published. The data was written and flushed when it was staged, so a full disk fails the
+/// write before anything is published.
+pub(crate) async fn publish<G: Send + 'static>(guard: G, files: Vec<Staged>) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let renamed = files.iter().try_for_each(|file| {
+            if let Some(dir) = file.dest_path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::rename(&file.tmp_path, &file.dest_path)
+        });
+        drop(guard);
+        renamed
+    })
+    .await??;
+    Ok(())
 }
 
 impl Drop for FileWriter<'_> {

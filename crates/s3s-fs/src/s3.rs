@@ -256,7 +256,7 @@ impl S3 for FileSystem {
         let src_path = self.get_object_path(bucket, key)?;
         let dst_path = self.get_object_path(&input.bucket, &input.key)?;
 
-        let _object_guards = self.lock_object_copy(bucket, key, &input.bucket, &input.key).await;
+        let object_guards = self.lock_object_copy(bucket, key, &input.bucket, &input.key).await;
         if src_path.exists().not() {
             return Err(s3_error!(NoSuchKey));
         }
@@ -313,31 +313,31 @@ impl S3 for FileSystem {
             return Err(s3_error!(PreconditionFailed));
         }
 
-        if let Some(dir_path) = dst_path.parent() {
-            try_!(fs::create_dir_all(&dir_path).await);
-        }
+        // Derive the destination ETag from the source ETag when available.
+        // This preserves non-MD5 ETag formats (e.g., multipart `{hash}-{part_count}`)
+        // and avoids re-hashing the copied bytes when the source has a stored ETag.
+        let dst_etag_str = match src_etag {
+            Some(etag) => etag.into_value(),
+            None => self.get_md5_sum(bucket, key).await?,
+        };
 
-        // `fs::copy(p, p)` truncates the file before reading it, so self-replace
-        // must preserve bytes in place while still updating LastModified.
-        let dst_last_modified = if src_path == dst_path {
+        // The destination's files are staged and renamed into place, never rewritten in place, so
+        // a reader still streaming the old body keeps reading the old bytes. A self-replace leaves
+        // the body untouched and only updates LastModified.
+        let mut staged = Vec::new();
+        let in_place_last_modified = if src_path == dst_path {
             let now = SystemTime::now();
             let file = try_!(std::fs::OpenOptions::new().write(true).open(&dst_path));
             try_!(file.set_times(FileTimes::new().set_modified(now)));
             debug!(path = %dst_path.display(), "replace file in place");
-            Timestamp::from(now)
+            Some(Timestamp::from(now))
         } else {
-            let _ = try_!(fs::copy(&src_path, &dst_path).await);
+            let mut src_file = try_!(fs::File::open(&src_path).await);
+            let mut file_writer = self.prepare_file_write(&dst_path).await?;
+            let _ = try_!(tokio::io::copy(&mut src_file, file_writer.writer()).await);
+            staged.push(file_writer.stage().await?);
             debug!(from = %src_path.display(), to = %dst_path.display(), "copy file");
-            let dst_metadata = try_!(fs::metadata(&dst_path).await);
-            Timestamp::from(try_!(dst_metadata.modified()))
-        };
-
-        // Derive the destination ETag from the source ETag when available.
-        // This preserves non-MD5 ETag formats (e.g., multipart `{hash}-{part_count}`)
-        // and avoids re-hashing the destination file.
-        let dst_etag_str = match src_etag {
-            Some(etag) => etag.into_value(),
-            None => self.get_md5_sum(&input.bucket, &input.key).await?,
+            None
         };
 
         // `MetadataDirective` defaults to `COPY` per AWS API: when the
@@ -366,16 +366,15 @@ impl S3 for FileSystem {
                 checksum_type: None,
             };
             dst_attrs.expires = input.expires;
-            self.save_object_attributes(&input.bucket, &input.key, &dst_attrs, None)
-                .await?;
+            staged.push(self.stage_object_attributes(&input.bucket, &input.key, &dst_attrs).await?);
         } else {
             let src_metadata_path = self.get_metadata_path(bucket, key, None)?;
             if src_metadata_path.exists() {
                 let dst_metadata_path = self.get_metadata_path(&input.bucket, &input.key, None)?;
-                // Same self-replace guard as for the payload above — `fs::copy`
-                // would zero the metadata sidecar when src == dst.
+                // A self-replace keeps the sidecar it already has.
                 if src_metadata_path != dst_metadata_path {
-                    let _ = try_!(fs::copy(src_metadata_path, dst_metadata_path).await);
+                    let content = try_!(fs::read(&src_metadata_path).await);
+                    staged.push(self.stage_bytes(&dst_metadata_path, &content).await?);
                 }
             }
         }
@@ -383,8 +382,14 @@ impl S3 for FileSystem {
         {
             let mut info = src_info.unwrap_or_default();
             crate::checksum::save_e_tag(&mut info, &dst_etag_str);
-            self.save_internal_info(&input.bucket, &input.key, &info).await?;
+            staged.push(self.stage_internal_info(&input.bucket, &input.key, &info).await?);
         }
+        crate::fs::publish(object_guards, staged).await?;
+
+        let dst_last_modified = match in_place_last_modified {
+            Some(last_modified) => last_modified,
+            None => Timestamp::from(try_!(try_!(fs::metadata(&dst_path).await).modified())),
+        };
 
         let copy_object_result = CopyObjectResult {
             e_tag: Some(ETag::Strong(dst_etag_str)),
@@ -1064,12 +1069,7 @@ impl S3 for FileSystem {
             return Err(s3_error!(BadDigest, "checksum_xxhash128 mismatch"));
         }
 
-        let object_guard = self.lock_object_write(&bucket, &key).await;
-        self.check_write_conditions(&bucket, &key, &object_path, if_none_match.as_ref(), if_match.as_ref())
-            .await?;
-        file_writer.done().await?;
-
-        debug!(path = %object_path.display(), ?size, %md5_sum, ?checksum, "write file");
+        let body_file = file_writer.stage().await?;
 
         // Save object attributes (including user metadata and standard attributes)
         let mut obj_attrs = ObjectAttributes {
@@ -1085,13 +1085,19 @@ impl S3 for FileSystem {
             checksum_type: None,
         };
         obj_attrs.expires = expires;
-        self.save_object_attributes(&bucket, &key, &obj_attrs, None).await?;
+        let attrs_file = self.stage_object_attributes(&bucket, &key, &obj_attrs).await?;
 
         let mut info: InternalInfo = default();
         crate::checksum::save_e_tag(&mut info, &md5_sum);
         crate::checksum::modify_internal_info(&mut info, &checksum);
-        self.save_internal_info(&bucket, &key, &info).await?;
-        drop(object_guard);
+        let info_file = self.stage_internal_info(&bucket, &key, &info).await?;
+
+        let object_guard = self.lock_object_write(&bucket, &key).await;
+        self.check_write_conditions(&bucket, &key, &object_path, if_none_match.as_ref(), if_match.as_ref())
+            .await?;
+        crate::fs::publish(object_guard, vec![body_file, attrs_file, info_file]).await?;
+
+        debug!(path = %object_path.display(), ?size, %md5_sum, ?checksum, "write file");
 
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(md5_sum)),
@@ -1594,24 +1600,23 @@ impl S3 for FileSystem {
             return Err(s3_error!(BadDigest, "{} mismatch", field));
         }
 
-        let object_guard = self.lock_object_write(&bucket, &key).await;
-        self.check_write_conditions(&bucket, &key, &object_path, if_none_match.as_ref(), if_match.as_ref())
-            .await?;
-        file_writer.done().await?;
-
+        let mut staged = vec![file_writer.stage().await?];
         if let Some(attrs) = &upload_attrs {
-            self.save_object_attributes(&bucket, &key, attrs, None).await?;
+            staged.push(self.stage_object_attributes(&bucket, &key, attrs).await?);
         }
-
-        debug!(?e_tag, path = %object_path.display(), "multipart etag");
-
         {
             let mut info: InternalInfo = default();
             crate::checksum::save_e_tag(&mut info, &e_tag);
             crate::checksum::modify_internal_info(&mut info, &checksum);
-            self.save_internal_info(&bucket, &key, &info).await?;
+            staged.push(self.stage_internal_info(&bucket, &key, &info).await?);
         }
-        drop(object_guard);
+
+        let object_guard = self.lock_object_write(&bucket, &key).await;
+        self.check_write_conditions(&bucket, &key, &object_path, if_none_match.as_ref(), if_match.as_ref())
+            .await?;
+        crate::fs::publish(object_guard, staged).await?;
+
+        debug!(?e_tag, path = %object_path.display(), "multipart etag");
 
         // The object is committed. Keep the upload ID until residue is removed so an abort can retry
         // cleanup after a failure, and never turn cleanup failure into an error response.
@@ -1875,6 +1880,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use futures::{Stream, StreamExt};
@@ -2019,10 +2025,13 @@ mod tests {
             .key(key.to_owned())
             .body(Some(StreamingBlob::wrap(stream)))
             .checksum_crc64nvme(crc64nvme(body))
+            .content_type(Some(String::from_utf8(body.to_vec()).unwrap()))
             .build()
             .unwrap()
     }
 
+    /// Runs every put at once. A writer that errors before the gate leaves the others waiting at
+    /// it for good, so each one is bounded.
     async fn race_puts(fs: &Arc<FileSystem>, inputs: Vec<PutObjectInput>) -> Vec<S3Result<S3Response<PutObjectOutput>>> {
         let tasks: Vec<_> = inputs
             .into_iter()
@@ -2033,12 +2042,30 @@ mod tests {
             .collect();
         let mut results = Vec::with_capacity(tasks.len());
         for task in tasks {
-            results.push(task.await.unwrap());
+            let joined = tokio::time::timeout(Duration::from_secs(60), task)
+                .await
+                .expect("a writer did not finish within 60 s");
+            results.push(joined.unwrap());
         }
         results
     }
 
-    async fn get(fs: &FileSystem, key: &str) -> (Vec<u8>, Option<String>) {
+    /// An object as one read returned it. Every test body is also written as its content type,
+    /// so a read pairs correctly only when its body, checksum and attributes all come from one
+    /// write.
+    struct Stored {
+        body: Vec<u8>,
+        checksum: Option<String>,
+        content_type: Option<String>,
+    }
+
+    impl Stored {
+        fn is_paired(&self) -> bool {
+            self.checksum == crc64nvme(&self.body) && self.content_type.as_deref().map(str::as_bytes) == Some(&self.body[..])
+        }
+    }
+
+    async fn get(fs: &FileSystem, key: &str) -> Stored {
         let input = GetObjectInput::builder()
             .bucket("bucket".to_owned())
             .key(key.to_owned())
@@ -2050,7 +2077,11 @@ mod tests {
         while let Some(chunk) = body.next().await {
             bytes.extend_from_slice(&chunk.unwrap());
         }
-        (bytes, output.checksum_crc64nvme)
+        Stored {
+            body: bytes,
+            checksum: output.checksum_crc64nvme,
+            content_type: output.content_type,
+        }
     }
 
     /// The single successful writer among `results`, after checking that every other one was
@@ -2083,9 +2114,9 @@ mod tests {
 
         let winner = sole_winner(&race_puts(&fs, inputs).await);
 
-        let (body, checksum) = get(&fs, "prov").await;
-        assert_eq!(body, bodies[winner], "the stored body is the winner's");
-        assert_eq!(checksum, crc64nvme(&body), "the stored checksum belongs to the stored body");
+        let stored = get(&fs, "prov").await;
+        assert_eq!(stored.body, bodies[winner], "the stored body is the winner's");
+        assert!(stored.is_paired(), "the stored checksum and attributes belong to the stored body");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2109,9 +2140,9 @@ mod tests {
 
         let winner = sole_winner(&race_puts(&fs, inputs).await);
 
-        let (body, checksum) = get(&fs, "record").await;
-        assert_eq!(body, bodies[winner], "the stored body is the winner's");
-        assert_eq!(checksum, crc64nvme(&body), "the stored checksum belongs to the stored body");
+        let stored = get(&fs, "record").await;
+        assert_eq!(stored.body, bodies[winner], "the stored body is the winner's");
+        assert!(stored.is_paired(), "the stored checksum and attributes belong to the stored body");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2130,9 +2161,8 @@ mod tests {
                 tokio::spawn(async move {
                     let (mut total, mut torn) = (0_usize, 0_usize);
                     while !stop.load(AtomicOrdering::SeqCst) {
-                        let (body, checksum) = get(&fs, "object").await;
                         total += 1;
-                        if checksum != crc64nvme(&body) {
+                        if !get(&fs, "object").await.is_paired() {
                             torn += 1;
                         }
                     }
@@ -2149,15 +2179,17 @@ mod tests {
             for result in race_puts(&fs, inputs).await {
                 result.unwrap();
             }
-            let (body, checksum) = get(&fs, "object").await;
-            assert_eq!(checksum, crc64nvme(&body), "round {round}: the last write's body and checksum differ");
+            assert!(
+                get(&fs, "object").await.is_paired(),
+                "round {round}: the last write's body, checksum and attributes differ"
+            );
         }
 
         stop.store(true, AtomicOrdering::SeqCst);
         for reader in readers {
             let (total, torn) = reader.await.unwrap();
             assert!(total > 0, "a reader never ran");
-            assert_eq!(torn, 0, "{torn} of {total} reads paired a body with another write's checksum");
+            assert_eq!(torn, 0, "{torn} of {total} reads paired a body with another write's files");
         }
     }
 }
