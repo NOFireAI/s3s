@@ -15,6 +15,7 @@ use s3s::s3_error;
 use s3s::{S3Request, S3Response};
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::fs::FileTimes;
 use std::io;
 use std::ops::Neg;
@@ -1705,7 +1706,7 @@ fn url_encode_listed(s: &str) -> String {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
