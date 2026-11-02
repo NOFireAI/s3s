@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - 'feat/**'
+      - 'ravel/**'
   merge_group:
     types: [ checks_requested ]
   schedule:
