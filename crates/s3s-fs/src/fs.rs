@@ -11,6 +11,7 @@ use s3s::dto;
 use s3s::dto::PartNumber;
 
 use std::env;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,14 +19,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use numeric_cast::NumericCast;
 use path_absolutize::Absolutize;
 use uuid::Uuid;
+
+/// How many locks the objects share; see [`FileSystem::lock_object_write`].
+const OBJECT_LOCK_STRIPES: u64 = 1024;
 
 #[derive(Debug)]
 pub struct FileSystem {
     pub(crate) root: PathBuf,
     tmp_file_counter: AtomicU64,
+    object_locks: Box<[RwLock<()>]>,
 }
 
 pub(crate) type InternalInfo = serde_json::Map<String, serde_json::Value>;
@@ -89,7 +96,62 @@ impl FileSystem {
         let root = env::current_dir()?.join(root).canonicalize()?;
         clean_old_tmp_files(&root)?;
         let tmp_file_counter = AtomicU64::new(0);
-        Ok(Self { root, tmp_file_counter })
+        let object_locks = (0..OBJECT_LOCK_STRIPES).map(|_| RwLock::new(())).collect();
+        Ok(Self {
+            root,
+            tmp_file_counter,
+            object_locks,
+        })
+    }
+
+    fn object_lock_index(bucket: &str, key: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        bucket.hash(&mut hasher);
+        key.hash(&mut hasher);
+        (hasher.finish() % OBJECT_LOCK_STRIPES).numeric_cast::<usize>()
+    }
+
+    /// Locks an object for writing.
+    ///
+    /// An object is three files: the body, its attributes and its internal info, which holds the
+    /// stored checksums and ETag. A write checks its conditions and publishes all three under this
+    /// lock, and a read opens the body and loads both sidecars under [`Self::lock_object_read`].
+    /// So two conditional writers cannot both pass their check, and a reader never pairs one
+    /// write's body with another write's checksums. Objects share a fixed set of locks by hash:
+    /// unrelated objects can contend, but the set never grows.
+    pub(crate) async fn lock_object_write(&self, bucket: &str, key: &str) -> RwLockWriteGuard<'_, ()> {
+        self.object_locks[Self::object_lock_index(bucket, key)].write().await
+    }
+
+    /// Locks an object for reading; see [`Self::lock_object_write`].
+    pub(crate) async fn lock_object_read(&self, bucket: &str, key: &str) -> RwLockReadGuard<'_, ()> {
+        self.object_locks[Self::object_lock_index(bucket, key)].read().await
+    }
+
+    /// Locks a copy's destination for writing and its source for reading. The two are taken in
+    /// index order, so two copies in opposite directions cannot deadlock. A source that shares the
+    /// destination's lock is covered by the write lock alone.
+    pub(crate) async fn lock_object_copy(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> (Option<RwLockReadGuard<'_, ()>>, RwLockWriteGuard<'_, ()>) {
+        let src_index = Self::object_lock_index(src_bucket, src_key);
+        let dst_index = Self::object_lock_index(dst_bucket, dst_key);
+        if src_index == dst_index {
+            return (None, self.object_locks[dst_index].write().await);
+        }
+        if src_index < dst_index {
+            let read = self.object_locks[src_index].read().await;
+            let write = self.object_locks[dst_index].write().await;
+            (Some(read), write)
+        } else {
+            let write = self.object_locks[dst_index].write().await;
+            let read = self.object_locks[src_index].read().await;
+            (Some(read), write)
+        }
     }
 
     pub(crate) fn resolve_abs_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {

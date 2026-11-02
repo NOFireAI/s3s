@@ -55,7 +55,7 @@ serde_json.workspace = true
 std-next.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
 tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
 tracing-error.workspace = true

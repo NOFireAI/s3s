@@ -191,6 +191,43 @@ fn completed_part_checksum(part: &CompletedPart) -> s3s::dto::Checksum {
     }
 }
 
+impl FileSystem {
+    /// Checks a write's `If-None-Match: *` and `If-Match` conditions against the stored object.
+    /// A write calls this once as an early refusal and again under the object's write lock, where
+    /// the answer cannot change before the write publishes.
+    async fn check_write_conditions(
+        &self,
+        bucket: &str,
+        key: &str,
+        object_path: &Path,
+        if_none_match: Option<&ETagCondition>,
+        if_match: Option<&ETagCondition>,
+    ) -> S3Result<()> {
+        if let Some(condition) = if_none_match
+            && condition.is_any()
+            && object_path.exists()
+        {
+            return Err(s3_error!(PreconditionFailed, "Object already exists"));
+        }
+        if let Some(condition) = if_match {
+            if !object_path.exists() {
+                return Err(s3_error!(PreconditionFailed, "Object does not exist"));
+            }
+            if let Some(expected) = condition.as_etag() {
+                let info = self.load_internal_info(bucket, key).await?;
+                let etag_value = match info.as_ref().and_then(crate::checksum::load_e_tag) {
+                    Some(v) => v,
+                    None => self.get_md5_sum(bucket, key).await?,
+                };
+                if !ETag::Strong(etag_value).strong_cmp(expected) {
+                    return Err(s3_error!(PreconditionFailed, "ETag does not match"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl S3 for FileSystem {
     #[tracing::instrument]
@@ -219,6 +256,7 @@ impl S3 for FileSystem {
         let src_path = self.get_object_path(bucket, key)?;
         let dst_path = self.get_object_path(&input.bucket, &input.key)?;
 
+        let _object_guards = self.lock_object_copy(bucket, key, &input.bucket, &input.key).await;
         if src_path.exists().not() {
             return Err(s3_error!(NoSuchKey));
         }
@@ -377,6 +415,7 @@ impl S3 for FileSystem {
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
         let path = self.get_object_path(&input.bucket, &input.key)?;
+        let _object_guard = self.lock_object_write(&input.bucket, &input.key).await;
         if path.exists().not() {
             if self.get_bucket_path(&input.bucket)?.exists().not() {
                 return Err(s3_error!(NoSuchBucket));
@@ -404,6 +443,7 @@ impl S3 for FileSystem {
         let mut deleted_objects: Vec<DeletedObject> = Vec::new();
         for object in input.delete.objects {
             let path = self.get_object_path(&input.bucket, &object.key)?;
+            let object_guard = self.lock_object_write(&input.bucket, &object.key).await;
             if object.key.ends_with('/') {
                 match fs::read_dir(&path).await {
                     Ok(mut dir) => {
@@ -426,6 +466,7 @@ impl S3 for FileSystem {
                     }
                 }
             }
+            drop(object_guard);
 
             let deleted_object = DeletedObject {
                 key: Some(object.key),
@@ -461,6 +502,9 @@ impl S3 for FileSystem {
         let input = req.input;
         let object_path = self.get_object_path(&input.bucket, &input.key)?;
 
+        // The body streams from the file opened here after the lock is released, so it stays the
+        // version that the sidecars loaded under the same lock describe.
+        let object_guard = self.lock_object_read(&input.bucket, &input.key).await;
         let mut file = fs::File::open(&object_path).await.map_err(|e| s3_error!(e, NoSuchKey))?;
 
         let file_metadata = try_!(file.metadata().await);
@@ -507,6 +551,7 @@ impl S3 for FileSystem {
             Some(info) if content_length == file_len => crate::checksum::from_internal_info(info),
             _ => default(),
         };
+        drop(object_guard);
 
         #[allow(clippy::redundant_closure_for_method_calls)]
         let output = GetObjectOutput {
@@ -555,6 +600,7 @@ impl S3 for FileSystem {
         let input = req.input;
         let path = self.get_object_path(&input.bucket, &input.key)?;
 
+        let object_guard = self.lock_object_read(&input.bucket, &input.key).await;
         if !path.exists() {
             if self.get_bucket_path(&input.bucket)?.exists().not() {
                 return Err(s3_error!(NoSuchBucket));
@@ -582,6 +628,7 @@ impl S3 for FileSystem {
             Some(info) => crate::checksum::from_internal_info(info),
             _ => default(),
         };
+        drop(object_guard);
 
         #[allow(clippy::redundant_closure_for_method_calls)]
         let output = HeadObjectOutput {
@@ -857,31 +904,13 @@ impl S3 for FileSystem {
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
-        // Check conditional headers before modifying any state.
         // If-None-Match: * means "only create if the object doesn't exist".
         // If-Match: <etag> means "only overwrite if ETag matches" (CAS).
+        // Checked again under the object's write lock before publishing; this early refusal only
+        // saves streaming a body that cannot be stored.
         let object_path = self.get_object_path(&bucket, &key)?;
-        if let Some(ref condition) = if_none_match
-            && condition.is_any()
-            && object_path.exists()
-        {
-            return Err(s3_error!(PreconditionFailed, "Object already exists"));
-        }
-        if let Some(ref condition) = if_match {
-            if !object_path.exists() {
-                return Err(s3_error!(PreconditionFailed, "Object does not exist"));
-            }
-            if let ETagCondition::ETag(expected) = condition {
-                let info = self.load_internal_info(&bucket, &key).await?;
-                let etag_value = match info.as_ref().and_then(crate::checksum::load_e_tag) {
-                    Some(v) => v,
-                    None => self.get_md5_sum(&bucket, &key).await?,
-                };
-                if !ETag::Strong(etag_value).strong_cmp(expected) {
-                    return Err(s3_error!(PreconditionFailed, "ETag does not match"));
-                }
-            }
-        }
+        self.check_write_conditions(&bucket, &key, &object_path, if_none_match.as_ref(), if_match.as_ref())
+            .await?;
 
         let mut checksum: s3s::checksum::ChecksumHasher = default();
         if input.checksum_crc32.is_some() {
@@ -1035,6 +1064,9 @@ impl S3 for FileSystem {
             return Err(s3_error!(BadDigest, "checksum_xxhash128 mismatch"));
         }
 
+        let object_guard = self.lock_object_write(&bucket, &key).await;
+        self.check_write_conditions(&bucket, &key, &object_path, if_none_match.as_ref(), if_match.as_ref())
+            .await?;
         file_writer.done().await?;
 
         debug!(path = %object_path.display(), ?size, %md5_sum, ?checksum, "write file");
@@ -1059,6 +1091,7 @@ impl S3 for FileSystem {
         crate::checksum::save_e_tag(&mut info, &md5_sum);
         crate::checksum::modify_internal_info(&mut info, &checksum);
         self.save_internal_info(&bucket, &key, &info).await?;
+        drop(object_guard);
 
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(md5_sum)),
@@ -1271,7 +1304,9 @@ impl S3 for FileSystem {
         let src_path = self.get_object_path(src_bucket, src_key)?;
         let dst_path = self.resolve_upload_part_path(upload_id, part_number)?;
 
+        let src_guard = self.lock_object_read(src_bucket, src_key).await;
         let mut src_file = fs::File::open(&src_path).await.map_err(|e| s3_error!(e, NoSuchKey))?;
+        drop(src_guard);
         let file_len = try_!(src_file.metadata().await).len();
 
         let (start, content_length) = if let Some(copy_range) = &input.copy_source_range {
@@ -1469,36 +1504,11 @@ impl S3 for FileSystem {
             return Err(s3_error!(NotImplemented, "Unsupported multipart checksum type"));
         }
 
-        // Check conditional headers before modifying any state
+        // Checked again under the object's write lock before publishing; this early refusal only
+        // saves assembling an object that cannot be stored.
         let object_path = self.get_object_path(&bucket, &key)?;
-        if let Some(ref condition) = if_none_match
-            && condition.is_any()
-            && object_path.exists()
-        {
-            return Err(s3_error!(PreconditionFailed, "Object already exists"));
-        }
-        if let Some(ref condition) = if_match {
-            if condition.is_any() {
-                // If-Match: * — require the object to exist
-                if !object_path.exists() {
-                    return Err(s3_error!(PreconditionFailed, "Object does not exist"));
-                }
-            } else if let Some(expected_etag) = condition.as_etag() {
-                if object_path.exists() {
-                    let info = self.load_internal_info(&bucket, &key).await?;
-                    let etag_value = match info.as_ref().and_then(crate::checksum::load_e_tag) {
-                        Some(e_tag) => e_tag,
-                        None => self.get_md5_sum(&bucket, &key).await?,
-                    };
-                    let existing_etag = ETag::Strong(etag_value);
-                    if !expected_etag.strong_cmp(&existing_etag) {
-                        return Err(s3_error!(PreconditionFailed, "ETag does not match"));
-                    }
-                } else {
-                    return Err(s3_error!(PreconditionFailed, "Object does not exist"));
-                }
-            }
-        }
+        self.check_write_conditions(&bucket, &key, &object_path, if_none_match.as_ref(), if_match.as_ref())
+            .await?;
 
         let expected_checksum = s3s::dto::Checksum {
             checksum_crc32,
@@ -1584,6 +1594,9 @@ impl S3 for FileSystem {
             return Err(s3_error!(BadDigest, "{} mismatch", field));
         }
 
+        let object_guard = self.lock_object_write(&bucket, &key).await;
+        self.check_write_conditions(&bucket, &key, &object_path, if_none_match.as_ref(), if_match.as_ref())
+            .await?;
         file_writer.done().await?;
 
         if let Some(attrs) = &upload_attrs {
@@ -1598,6 +1611,7 @@ impl S3 for FileSystem {
             crate::checksum::modify_internal_info(&mut info, &checksum);
             self.save_internal_info(&bucket, &key, &info).await?;
         }
+        drop(object_guard);
 
         // The object is committed. Keep the upload ID until residue is removed so an abort can retry
         // cleanup after a failure, and never turn cleanup failure into an error response.
