@@ -114,7 +114,7 @@ impl FileSystem {
     /// Locks an object for writing.
     ///
     /// An object is three files: the body, its attributes and its internal info, which holds the
-    /// stored checksums and ETag. A write checks its conditions and publishes all three under this
+    /// stored checksums and `ETag`. A write checks its conditions and publishes all three under this
     /// lock, and a read opens the body and loads both sidecars under [`Self::lock_object_read`].
     /// So two conditional writers cannot both pass their check, and a reader never pairs one
     /// write's body with another write's checksums. Objects share a fixed set of locks by hash:
